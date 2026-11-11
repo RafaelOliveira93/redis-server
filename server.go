@@ -20,11 +20,18 @@ type RESPValue struct {
 	Array []RESPValue
 }
 
-var (
-	memory  = make(map[string]string) // RAM
-	aofFile *os.File                  // DISK
+type MemoryItem struct {
+	Value     string
+	ExpiresIn time.Time
+}
 
-	mu sync.RWMutex
+var (
+	memory  = make(map[string]MemoryItem) // RAM
+	aofFile *os.File                      // DISK
+	mu      sync.RWMutex
+
+	pubsub   = make(map[string][]chan string)
+	pubsubMu sync.RWMutex
 )
 
 func main() {
@@ -112,7 +119,9 @@ func handleConnection(c net.Conn) {
 
 				mu.Lock()
 
-				memory[key] = valText // RAM
+				memory[key] = MemoryItem{
+					Value: valText,
+				} // RAM
 
 				// appends all the sets to aof
 
@@ -132,14 +141,20 @@ func handleConnection(c net.Conn) {
 				keyText := val.Array[1].Str
 
 				mu.RLock()
-				valText, exists := memory[keyText]
+				item, exists := memory[keyText]
 				mu.RUnlock()
 
-				if !exists {
+				if !exists || (!item.ExpiresIn.IsZero() && time.Now().After(item.ExpiresIn)) {
+					if exists {
+						mu.Lock()
+						delete(memory, keyText)
+						mu.Unlock()
+					}
+
 					c.Write([]byte("$-1\r\n"))
 					continue
 				} else {
-					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(valText), valText)
+					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(item.Value), item.Value)
 					c.Write([]byte(resp))
 				}
 
@@ -170,6 +185,102 @@ func handleConnection(c net.Conn) {
 
 				resp := fmt.Sprintf(":%d\r\n", numDeletions)
 				c.Write([]byte(resp))
+
+			case "EXPIRE":
+				if len(val.Array) < 3 {
+					c.Write([]byte("-ERR wrong number of arguments for 'expire' command\r\n"))
+					continue
+				}
+
+				keyText := val.Array[1].Str
+				secondsStr := val.Array[2].Str
+
+				seconds, err := strconv.Atoi(secondsStr)
+
+				if err != nil {
+					c.Write([]byte("-ERR value is not an integer or out of range\r\n"))
+					continue
+				}
+
+				mu.Lock()
+				item, exists := memory[keyText]
+
+				if exists {
+					item.ExpiresIn = time.Now().Add(time.Duration(seconds) * time.Second)
+					memory[keyText] = item
+
+					logLine := fmt.Sprintf("EXPIRE %s %s\n", keyText, secondsStr)
+					aofFile.WriteString(logLine)
+
+					mu.Unlock()
+					c.Write([]byte(":1\r\n"))
+				} else {
+					mu.Unlock()
+					c.Write([]byte(":0\r\n"))
+				}
+
+			case "PUBLISH":
+				if len(val.Array) < 3 {
+					c.Write([]byte("-ERR wrong number of arguments for 'publish' command\r\n"))
+					continue
+				}
+
+				topic := val.Array[1].Str
+				message := val.Array[2].Str
+
+				pubsubMu.RLock()
+				subscribers := pubsub[topic]
+				pubsubMu.RUnlock()
+
+				counter := 0
+
+				for _, channel := range subscribers {
+					channel <- message
+					counter++
+				}
+
+				resp := fmt.Sprintf(":%d\r\n", counter)
+				c.Write([]byte(resp))
+
+			case "SUBSCRIBE":
+				if len(val.Array) < 2 {
+					c.Write([]byte("-ERR wrong number of arguments for 'subscribe' command\r\n"))
+					continue
+				}
+
+				topic := val.Array[1].Str
+
+				myChannel := make(chan string)
+
+				pubsubMu.Lock()
+				pubsub[topic] = append(pubsub[topic], myChannel)
+				pubsubMu.Unlock()
+
+				defer func() {
+					pubsubMu.Lock()
+					subscribers := pubsub[topic]
+
+					for i, channel := range subscribers {
+						if channel == myChannel {
+							pubsub[topic] = append(subscribers[:i], subscribers[i+1:]...)
+							break
+						}
+					}
+
+					pubsubMu.Unlock()
+					fmt.Printf("Client removed from topic '%s'\n", topic)
+					close(myChannel)
+				}()
+
+				go func() {
+					for receivedMessage := range myChannel {
+						respMsg := fmt.Sprintf("*3\r\n$7\r\nmessage\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(topic), topic, len(receivedMessage), receivedMessage)
+						_, err := c.Write([]byte(respMsg))
+						if err != nil {
+							break
+						}
+					}
+				}()
 
 			case "BGREWRITEAOF":
 				go rewriteAOF()
@@ -286,16 +397,30 @@ func loadAOF() {
 
 		if command == "SET" && len(words) >= 3 {
 			key := words[1]
-
 			val := strings.Join(words[2:], " ")
 
-			memory[key] = val
+			memory[key] = MemoryItem{
+				Value: val,
+			}
+
 			loadedCommands++
 		} else if command == "DEL" && len(words) >= 2 {
 			key := words[1]
-
 			delete(memory, key)
 			loadedCommands++
+		} else if command == "EXPIRE" && len(words) >= 3 {
+			key := words[1]
+			secondsStr := words[2]
+
+			seconds, err := strconv.Atoi(secondsStr)
+			if err == nil {
+				item, exists := memory[key]
+				if exists {
+					item.ExpiresIn = time.Now().Add(time.Duration(seconds) * time.Second)
+					memory[key] = item
+					loadedCommands++
+				}
+			}
 		}
 	}
 
@@ -329,10 +454,20 @@ func rewriteAOF() {
 	}
 
 	writtenCommands := 0
-	for key, val := range memory {
-		line := fmt.Sprintf("SET %s %s\n", key, val)
+	for key, item := range memory {
+		line := fmt.Sprintf("SET %s %s\n", key, item.Value)
 		tempFile.WriteString(line)
 		writtenCommands++
+
+		if !item.ExpiresIn.IsZero() {
+			remainingSeconds := int(time.Until(item.ExpiresIn).Seconds())
+
+			if remainingSeconds > 0 {
+				lineExpire := fmt.Sprintf("EXPIRE %s %d\n", key, remainingSeconds)
+				tempFile.WriteString(lineExpire)
+				writtenCommands++
+			}
+		}
 	}
 	tempFile.Close()
 	mu.RUnlock()
