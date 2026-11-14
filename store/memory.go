@@ -107,3 +107,20 @@ func Delete(key string) bool {
 	}
 	return false
 }
+
+func Keys() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	var keys []string
+	now := time.Now()
+
+	for key, item := range memory {
+		if !item.ExpiresIn.IsZero() && now.After(item.ExpiresIn) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+
+	return keys
+}

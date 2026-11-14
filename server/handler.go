@@ -185,6 +185,27 @@ func HandleConnection(c net.Conn) {
 				}
 			}
 
+		case "KEYS":
+			if len(val.Array) < 2 {
+				c.Write([]byte("-ERR wrong number of arguments for 'keys' command\r\n"))
+				break
+			}
+
+			keys := store.Keys()
+
+			respMsg := fmt.Sprintf("*%d\r\n", len(keys))
+			for _, k := range keys {
+				respMsg += fmt.Sprintf("$%d\r\n%s\r\n", len(k), k)
+			}
+
+			c.Write([]byte(respMsg))
+
+		case "COMMAND":
+			c.Write([]byte("*0\r\n"))
+
+		case "CONFIG":
+			c.Write([]byte("*0\r\n"))
+
 		default:
 			c.Write([]byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", command)))
 		}
